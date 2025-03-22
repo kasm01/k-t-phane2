@@ -1,0 +1,54 @@
+Önbellekleme ve threading mekanizmalarını
+# - LightGBM + CatBoost + Gradient Boosting + Logistic Regression + LSTM modelleri
+# - GridSearchCV + Hiperparametre Tuning
+# - Understat & WhoScored scraping (xG verisi için uyumlu yapı)
+# - Tahmin komutları: /2gol /kgvar /mac_sonucu /siradaki_gol /ligler
+# - Anomali Tespiti
+# - Günlük otomatik model eğitimi + tahmin bildirim sistemi
+# - SQLite cache ile önbellekleme
+# - Çoklu işlem (Threading) ile zamanlama
+# - GridSearchCV + Hiperparametre Tuning
+SQLite tabanlı önbellekleme (API yükünü azaltır)
+/2gol → 2+ gol olabilecek maçları tahmin eder
+/kgvar → Karşılıklı gol var/yok tahmini
+/mac_sonucu → Maçın kazanan tarafını tahmin eder
+/siradaki_gol → Canlı maçlarda sıradaki golü atacak takım tahmini lig ve takım adıyla birlikte
+/ligler → Takip edilen ligleri listeler
+Veri Kaynakları: Understat & WhoScored scraping (xG verisi)
+AI Modelleri: LightGBM, CatBoost, Gradient Boosting, Logistic Regression, LSTM
+Hiperparametre optimizasyonu: GridSearchCV destekli
+Understat & WhoScored Scraping:
+xG verileri ve takım istatistikleri doğrudan bu sitelerden çekilecek.
+Özellik mühendisliği sürecine entegre edilerek model doğruluğu artırılacak.
+API Yedekleme Sistemi:
+API Sports, CollectAPI, Sportmonks sırasıyla kontrol edilir.
+Biri çalışmazsa diğerine geçer, böylece veri akışı kesilmez.
+Model Performans Raporlama Sistemi:
+Her model tahmini sonrası doğruluk, precision, recall, F1-score gibi metrikleri log'lar.
+Google Drive'daki Conlı_bot/performance_logs/ klasörüne günlük kayıt yapılır.
+Haftada 1 kez (örneğin Pazar gecesi 03:00) geçmiş maçları alıp modeli yeniden eğitip güncelleyen bir scheduler sistemi
+Özellik mühendisliği modülü ile antrenman verileri zenginleştir.
+Threading + çoklu işlem ve önbellekleme ile daha hızlı ve ekonomik API kullanımı
+
+1. Tahmin ve Analiz Derinliği:
+
+xG & ShotMap entegrasyonu: Takımların maç içi hücum etkinliği artık sadece gol değil, gol beklentisi ve şut kalitesi ile değerlendirilecek.
+
+LSTM & Prophet Trend Analizi: Takımların geçmiş performans eğilimlerine göre ileriye dönük skor tahminleri yapılabilecek.
+
+2. Gelişmiş Veri Kaynakları:
+
+WhoScored & Transfermarkt Scraping: Kadro kalitesi, eksikler, form grafiği gibi faktörler model eğitimine dahil edilecek.
+
+Selenium ile dinamik veri erişimi: Canlı istatistiklere erişim imkanı oluşacak.
+BeautifulSoup + Selenium ile WhoScored ve Transfermarkt istatistikleri model eğitimine dahil edilebilir.
+xG & ShotMap Entegrasyonu:
+
+Understat veya FBref üzerinden xG verileri ve şut haritası scraping ile alınabilir.
+
+Bu sayede modelin pozisyon bazlı doğruluğu artırılabilir.
+
+Zaman Serisi Modelleri:
+
+LSTM, Prophet, ARIMA gibi modellerle trend analizi yapılabilir.
+Özellikle gol dakikası, form, maç temposu gibi verilerle iyi sonuçlar verir.
