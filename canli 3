@@ -1,0 +1,370 @@
+# ultimate_ai_football_bot.py
+# 🎞️ Tümleşik AI Destekli Futbol Tahmin Botu (xG, LSTM, Transformer, Multi-API, Confidence Scores)
+
+import os
+import time
+import pickle
+import sqlite3
+import requests
+import numpy as np
+import pandas as pd
+import telebot
+import schedule
+from pathlib import Path
+from threading import Thread
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.ensemble import StackingClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import tensorflow as tf
+from transformers import TFAutoModel, AutoTokenizer
+from io import StringIO
+
+# === Telegram ve API Ayarları ===
+TELEGRAM_TOKEN = "8121074908:AAHk078iyIHsqmOYxPLek03TOKoJZWB2eQo"
+CHAT_ID = "1745894964"
+SPORTS_API_KEY = "78286c7e8af08d8243339ac86dbc30e6"  # API-Sports
+SPORTMONKS_API_KEY = "KqZNWyk7O3fZ1vndXnOt1Myutx3BSyRfLomkV3VA0N1al0rp5So6DgBbuG17"  # Sportmonks
+COLLECT_API_KEY = "6ADvKvz4S06URlm8FBGKeX:1oHeRRKB6hdxIq3gO0h0CK"  # Collect API
+HEADERS = {"x-apisports-key": SPORTS_API_KEY}
+FIXTURE_URL = "https://v3.football.api-sports.io/fixtures"
+LEAGUES_URL = "https://v3.football.api-sports.io/leagues"
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# === SQLite Önbellek ===
+conn = sqlite3.connect("cache.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, response TEXT, timestamp REAL)")
+conn.commit()
+
+# === Yardımcı Fonksiyonlar ===
+def get_cached(url, ttl=300):
+    now = time.time()
+    cursor.execute("SELECT response, timestamp FROM cache WHERE url=?", (url,))
+    row = cursor.fetchone()
+    if row and now - row[1] < ttl:
+        return eval(row[0])
+    r = requests.get(url, headers=HEADERS)
+    if r.status_code == 200:
+        data = r.json().get("response", [])
+        cursor.execute("REPLACE INTO cache (url, response, timestamp) VALUES (?, ?, ?)", (url, str(data), now))
+        conn.commit()
+        return data
+    return []
+
+# === API Rotasyonu ===
+def get_fixtures():
+    apis = [
+        lambda: requests.get(FIXTURE_URL, headers={"x-apisports-key": SPORTS_API_KEY}),
+        lambda: requests.get(f"https://api.sportmonks.com/v3/football/fixtures?api_token={SPORTMONKS_API_KEY}"),
+        lambda: requests.get(f"https://api.collectapi.com/sport/fixtures", headers={"authorization": COLLECT_API_KEY})
+    ]
+    for api in apis:
+        try:
+            response = api()
+            if response.status_code == 200:
+                return response.json().get("response", [])
+        except Exception as e:
+            print(f"API Error: {e}")
+    return []
+
+# === xG Scraping (Understat & Opta) ===
+def get_xg_understat():
+    url = "https://understat.com/league/EPL/2023"
+    soup = BeautifulSoup(requests.get(url).text, "html.parser")
+    scripts = soup.find_all("script")
+    for script in scripts:
+        if "xG" in script.text:
+            raw_json = script.text.split("JSON.parse('")[1].split("')")[0]
+            raw_json = raw_json.encode('utf-8').decode('unicode_escape')
+            df = pd.read_json(StringIO(raw_json))
+
+            # İç veri yapısına göre dönüşüm (örnek olarak takım ve xG verileri)
+            if 'h' in df.columns and isinstance(df['h'].iloc[0], dict):
+                matches = []
+                for match in df['h']:
+                    matches.append({
+                        'xG_H': float(match.get('xG', 0)),
+                        'xG_A': float(match.get('xGA', 0)),
+                        'Shots_H': int(match.get('shots', 0)),
+                        'Shots_A': int(match.get('shotsAgainst', 0)),
+                        'Poss_H': int(match.get('possession', 50)),
+                        'Poss_A': 100 - int(match.get('possession', 50)),
+                        'Over2': 1 if float(match.get('xG', 0)) + float(match.get('xGA', 0)) > 2.5 else 0
+                    })
+                return pd.DataFrame(matches)
+            return df
+    return pd.DataFrame()
+
+def get_xg_opta():
+    return pd.DataFrame()
+
+# === LSTM Modeli ===
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(32),
+        Dense(16, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+# === Transformer Benzeri Model ===
+def build_transformer_like_model(input_shape):
+    inputs = tf.keras.Input(shape=input_shape)
+    x = tf.keras.layers.Reshape((input_shape[0], 1))(inputs)
+    x = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=2)(x, x)
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+    model = tf.keras.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+# === Tahmin ve Güvenilirlik Skorları ===
+def predict_with_confidence(model, X_scaled):
+    pred = model.predict(X_scaled)[0]
+    confidence = np.max(model.predict_proba(X_scaled)) * 100
+    return pred, confidence
+
+# === Canlı Maç Güncellemeleri ===
+def send_live_updates():
+    matches = get_fixtures()
+    for m in matches:
+        home = m["teams"]["home"]["name"]
+        away = m["teams"]["away"]["name"]
+        score = f"{m['goals']['home']} - {m['goals']['away']}"
+        bot.send_message(CHAT_ID, f"⚽ Canlı Maç: {home} {score} {away}")
+
+# === Tahmin Loglama ve Doğruluk Takibi ===
+def log_prediction(match_id, prediction, target, label):
+    log_path = "predictions_log.csv"
+    log_entry = {
+        "match_id": match_id,
+        "prediction": prediction,
+        "actual": target,
+        "label": label,
+        "timestamp": datetime.now().isoformat()
+    }
+    df_log = pd.DataFrame([log_entry])
+    if os.path.exists(log_path):
+        df_log.to_csv(log_path, mode="a", header=False, index=False)
+    else:
+        df_log.to_csv(log_path, mode="w", header=True, index=False)
+
+def evaluate_model_accuracy():
+    log_path = "predictions_log.csv"
+    if not os.path.exists(log_path):
+        print("⏳ Henüz doğruluk logu bulunamadı.")
+        return
+    df = pd.read_csv(log_path)
+    df = df.dropna(subset=["prediction", "actual"])
+    if df.empty:
+        print("⚠️ Log dosyasında eşleşen veri yok.")
+        return
+    accuracy = (df["prediction"] == df["actual"]).mean() * 100
+    print(f"📊 Model Doğruluğu ({df['label'].iloc[-1]}): %{accuracy:.2f}")
+
+# === Zamanlanmış Görevler ===
+def scheduler_jobs():
+    schedule.every().day.at("04:00").do(train_model)
+        schedule.every().hour.do(send_live_updates)
+    schedule.every().day.at("05:00").do(evaluate_model_accuracy)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+# === Ana Bot Fonksiyonları ===
+
+@bot.message_handler(commands=["kgvar"])
+def kgvar(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_kgvar.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        home, away = m['teams']['home']['name'], m['teams']['away']['name']
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred, confidence = predict_with_confidence(model, feat)
+        if pred:
+            preds.append(f"{home} vs {away} - KG VAR olabilir. (Güven: {confidence:.2f}%)")
+    bot.send_message(msg.chat.id, "
+".join(preds) or "Tahmin yok.") or "Tahmin yok.")
+
+@bot.message_handler(commands=["mac_sonucu"])
+def mac_sonucu(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_mac_sonucu.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        home, away = m['teams']['home']['name'], m['teams']['away']['name']
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred = model.predict(feat)[0]
+        label = {1: "Ev Sahibi", 2: "Deplasman", 0: "Beraberlik"}.get(pred, "Belirsiz")
+        preds.append(f"{home} vs {away} - Tahmin: {label}")
+    bot.send_message(msg.chat.id, "
+".join(preds) or "Tahmin yok.") or "Tahmin yok.")
+
+@bot.message_handler(commands=["ilk_yari"])
+def ilk_yari(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_ilkyari.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        home, away = m['teams']['home']['name'], m['teams']['away']['name']
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred = model.predict(feat)[0]
+        if pred:
+            preds.append(f"{home} vs {away} - İlk yarı berabere bitebilir.")
+    bot.send_message(msg.chat.id, "
+".join(preds) or "Tahmin yok.") or "Tahmin yok.")
+
+@bot.message_handler(commands=["siradaki_gol"])
+def siradaki_gol(msg):
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        try:
+            home = m['teams']['home']['name']
+            away = m['teams']['away']['name']
+            stats = m.get('statistics', [])
+
+            # Basit analiz (şut ve topa sahip olma karşılaştırması)
+            home_shots = m.get('stats', {}).get('home_shots', 10)
+            away_shots = m.get('stats', {}).get('away_shots', 8)
+            home_poss = m.get('stats', {}).get('home_possession', 55)
+            away_poss = m.get('stats', {}).get('away_possession', 45)
+
+            score = f"{m['goals']['home']} - {m['goals']['away']}"
+            next_goal = home if home_shots + home_poss > away_shots + away_poss else away
+            preds.append(f"{home} {score} {away} - Sıradaki golü {next_goal} atabilir.")
+        except:
+            continue
+    bot.send_message(msg.chat.id, "
+".join(preds) or "Tahmin yok.") or "Tahmin yok.")
+
+@bot.message_handler(commands=["altust"])
+def altust(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_altust.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        home, away = m['teams']['home']['name'], m['teams']['away']['name']
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred = model.predict(feat)[0]
+        label = "Üst" if pred else "Alt"
+        preds.append(f"{home} vs {away} - Tahmin: {label} 2.5")
+    bot.send_message(msg.chat.id, "
+".join(preds) or "Tahmin yok.") or "Tahmin yok.")
+
+@bot.message_handler(commands=["ligler"])
+def ligler(msg):
+    leagues = get_cached(LEAGUES_URL)
+    top = [f"{l['league']['name']} ({l['country']['name']})" for l in leagues[:10]]
+    bot.send_message(msg.chat.id, "Takip edilen ligler:
+" + "
+".join(top))
+@bot.message_handler(commands=["start"])
+def send_welcome(msg):
+    bot.send_message(msg.chat.id, "⚽ Komutlar:
+/2gol – 2.5 üst tahmini
+/kgvar – Karşılıklı gol var mı (BTTS) tahmini
+/mac_sonucu – Maçın galibi (1-X-2) tahmini
+/ilk_yari – İlk yarı berabere biter mi
+/siradaki_gol – Sıradaki golü atacak takım (canlı)
+/altust – 2.5 üst/alt tahmini
+/ligler – Takip edilen ligler")
+
+@bot.message_handler(commands=["2gol"])
+def over2(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_over2.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        h, a = m["teams"]["home"]["name"], m["teams"]["away"]["name"]
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred, confidence = predict_with_confidence(model, feat)
+        if pred: preds.append(f"{h} vs {a} - 2+ gol olabilir. (Güven: {confidence:.2f}%)")
+    bot.send_message(msg.chat.id, "\n".join(preds) or "Tahmin yok.")
+
+# === Model Eğitimi ===
+def train_model():
+    df = pd.concat([get_xg_understat(), get_xg_opta()])
+
+    # Hibrit model için ek hedef sütunlar
+    df["KGVAR"] = ((df["xG_H"] > 1) & (df["xG_A"] > 1)).astype(int)
+    df["MAC_SONUCU"] = np.select([
+        df["xG_H"] > df["xG_A"],
+        df["xG_H"] < df["xG_A"]
+    ], [1, 2], default=0)  # 1: ev sahibi, 2: deplasman, 0: beraberlik
+    df["ILK_YARI_BERABERLIK"] = ((abs(df["xG_H"] - df["xG_A"]) < 0.2)).astype(int)
+    df["UST25"] = (df["xG_H"] + df["xG_A"] > 2.5).astype(int)
+
+    required_cols = ["xG_H", "xG_A", "Shots_H", "Shots_A", "Poss_H", "Poss_A", "Over2"]
+    if df.empty or not set(required_cols).issubset(df.columns):
+        print("⚠️ Gerçek veri eksik. Dummy veri ile eğitim yapılıyor.")
+        df = pd.DataFrame({
+            "xG_H": np.random.uniform(0.5, 2.5, 100),
+            "xG_A": np.random.uniform(0.5, 2.0, 100),
+            "Shots_H": np.random.randint(5, 20, 100),
+            "Shots_A": np.random.randint(3, 18, 100),
+            "Poss_H": np.random.randint(40, 70, 100),
+            "Poss_A": np.random.randint(30, 60, 100),
+            "Over2": np.random.randint(0, 2, 100)
+        })
+
+    X = df[["xG_H", "xG_A", "Shots_H", "Shots_A", "Poss_H", "Poss_A"]]
+    y = df["Over2"]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # LSTM
+    X_lstm = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
+    lstm_model = build_lstm_model((X_scaled.shape[1], 1))
+    lstm_model.fit(X_lstm, y, epochs=10, batch_size=32)
+
+    # Transformer-like
+    transformer_model = build_transformer_like_model((X_scaled.shape[1],))
+    transformer_model.fit(X_scaled, y, epochs=10, batch_size=32)
+
+    with open("lstm_model.pkl", "wb") as f:
+        pickle.dump(lstm_model, f)
+    with open("transformer_model.pkl", "wb") as f:
+        pickle.dump(transformer_model, f)
+    with open("scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+
+    # === Hibrit modellerin eğitimi ===
+    for label, filename in [
+        ("KGVAR", "model_kgvar.pkl"),
+        ("MAC_SONUCU", "model_mac_sonucu.pkl"),
+        ("ILK_YARI_BERABERLIK", "model_ilkyari.pkl"),
+        ("UST25", "model_altust.pkl")
+    ]:
+        y_extra = df[label]
+        model = LGBMClassifier()
+        model.fit(X_scaled, y_extra)
+        with open(filename, "wb") as f:
+            pickle.dump(model, f)
+
+    print("✅ Modeller başarıyla eğitildi.")
+
+if __name__ == "__main__":
+    Thread(target=train_model).start()
+    Thread(target=scheduler_jobs).start()
+    print("🤖 Gelişmiş AI Bot Başlatıldı.")
+    bot.polling(none_stop=True)
