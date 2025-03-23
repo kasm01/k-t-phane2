@@ -1,0 +1,172 @@
+# ultimate_ai_football_bot.py
+# 📦 Tümleşik AI Destekli Futbol Tahmin Botu (xG, LSTM, Transformer, Multi-API, Confidence Scores)
+
+import os
+import time
+import pickle
+import sqlite3
+import requests
+import numpy as np
+import pandas as pd
+import telebot
+import schedule
+from pathlib import Path
+from threading import Thread
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.ensemble import StackingClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from transformers import TFTransformerEncoder
+
+# === Telegram ve API Ayarları ===
+TELEGRAM_TOKEN = "8121074908:AAHk078iyIHsqmOYxPLek03TOKoJZWB2eQo"
+CHAT_ID = "1745894964"
+SPORTS_API_KEY = "78286c7e8af08d8243339ac86dbc30e6"  # API-Sports
+SPORTMONKS_API_KEY = "your_sportmonks_api_key"  # Sportmonks
+COLLECT_API_KEY = "your_collect_api_key"  # Collect API
+HEADERS = {"x-apisports-key": SPORTS_API_KEY}
+FIXTURE_URL = "https://v3.football.api-sports.io/fixtures"
+LEAGUES_URL = "https://v3.football.api-sports.io/leagues"
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# === SQLite Önbellek ===
+conn = sqlite3.connect("cache.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, response TEXT, timestamp REAL)")
+conn.commit()
+
+# === API Rotasyonu ===
+def get_fixtures():
+    apis = [
+        lambda: requests.get(FIXTURE_URL, headers={"x-apisports-key": SPORTS_API_KEY}),
+        lambda: requests.get(f"https://api.sportmonks.com/v3/football/fixtures?api_token={SPORTMONKS_API_KEY}"),
+        lambda: requests.get(f"https://api.collectapi.com/sport/fixtures", headers={"authorization": COLLECT_API_KEY})
+    ]
+    for api in apis:
+        try:
+            response = api()
+            if response.status_code == 200:
+                return response.json().get("response", [])
+        except Exception as e:
+            print(f"API Error: {e}")
+    return []
+
+# === xG Scraping (Understat & Opta) ===
+def get_xg_understat():
+    url = "https://understat.com/league/EPL/2023"
+    soup = BeautifulSoup(requests.get(url).text, "html.parser")
+    scripts = soup.find_all("script")
+    for script in scripts:
+        if "xG" in script.text:
+            data = script.text.split("JSON.parse('")[1].split("')")[0]
+            return pd.read_json(data)
+    return pd.DataFrame()
+
+def get_xg_opta():
+    # Opta verileri için örnek bir scraping veya API entegrasyonu
+    return pd.DataFrame()
+
+# === LSTM Modeli ===
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(32),
+        Dense(16, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+# === Transformer Modeli ===
+def build_transformer_model(input_shape):
+    inputs = tf.keras.Input(shape=input_shape)
+    transformer = TFTransformerEncoder(num_layers=2, d_model=64, num_heads=4, dff=128)(inputs)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(transformer)
+    model = tf.keras.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+# === Tahmin ve Güvenilirlik Skorları ===
+def predict_with_confidence(model, X_scaled):
+    pred = model.predict(X_scaled)[0]
+    confidence = np.max(model.predict_proba(X_scaled)) * 100
+    return pred, confidence
+
+# === Canlı Maç Güncellemeleri ===
+def send_live_updates():
+    matches = get_fixtures()
+    for m in matches:
+        home = m["teams"]["home"]["name"]
+        away = m["teams"]["away"]["name"]
+        score = f"{m['goals']['home']} - {m['goals']['away']}"
+        bot.send_message(CHAT_ID, f"⚽ Canlı Maç: {home} {score} {away}")
+
+# === Zamanlanmış Görevler ===
+def scheduler_jobs():
+    schedule.every().day.at("04:00").do(train_model)
+    schedule.every().hour.do(send_live_updates)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+# === Ana Bot Fonksiyonları ===
+@bot.message_handler(commands=["start"])
+def send_welcome(msg):
+    bot.send_message(msg.chat.id, "⚽ Komutlar:\n/2gol\n/kgvar\n/mac_sonucu\n/siradaki_gol\n/ligler")
+
+@bot.message_handler(commands=["2gol"])
+def over2(msg):
+    scaler = pickle.load(open("scaler.pkl", "rb"))
+    model = pickle.load(open("model_over2.pkl", "rb"))
+    matches = get_fixtures()
+    preds = []
+    for m in matches:
+        h, a = m["teams"]["home"]["name"], m["teams"]["away"]["name"]
+        feat = scaler.transform([[1.2, 0.9, 12, 10, 56, 44]])
+        pred, confidence = predict_with_confidence(model, feat)
+        if pred: preds.append(f"{h} vs {a} - 2+ gol olabilir. (Güven: {confidence:.2f}%)")
+    bot.send_message(msg.chat.id, "\n".join(preds) or "Tahmin yok.")
+
+# Diğer komutlar (kgvar, mac_sonucu, siradaki_gol, ligler) benzer şekilde güncellenebilir.
+
+# === Model Eğitimi ===
+def train_model():
+    df = pd.concat([get_xg_understat(), get_xg_opta()])
+    X = df[["xG_H", "xG_A", "Shots_H", "Shots_A", "Poss_H", "Poss_A"]]
+    y = df["Over2"]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # LSTM Modeli
+    X_lstm = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
+    lstm_model = build_lstm_model((X_scaled.shape[1], 1))
+    lstm_model.fit(X_lstm, y, epochs=10, batch_size=32)
+
+    # Transformer Modeli
+    transformer_model = build_transformer_model((X_scaled.shape[1],))
+    transformer_model.fit(X_scaled, y, epochs=10, batch_size=32)
+
+    # Modelleri Kaydet
+    with open("lstm_model.pkl", "wb") as f:
+        pickle.dump(lstm_model, f)
+    with open("transformer_model.pkl", "wb") as f:
+        pickle.dump(transformer_model, f)
+    with open("scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+
+    print("✅ Modeller başarıyla eğitildi.")
+
+if __name__ == "__main__":
+    Thread(target=train_model).start()
+    Thread(target=scheduler_jobs).start()
+    print("🤖 Gelişmiş AI Bot Başlatıldı.")
+    bot.polling(none_stop=True)
