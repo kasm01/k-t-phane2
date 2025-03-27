@@ -1,0 +1,12 @@
+{Sıradaki gol, 2+ gol, maç sonucu} komutlarında golü atacak takım yanında güvenirlik yüzdesi verilsin.
+güvenirlik yüzdeleri {Toplam fark üzerinden % tahmin
+Şut farkı ve topa sahip olma yüzdesi de hesaba katılıyor
+Maksimum %100 sınırı korunuyor
+Şut farkı
+Topa sahip olma farkı
+xG farkı (expected goals)
+Son 5 maç form katkısı (şimdilik dummy veriyle, ileride gerçek form verisiyle çalışacak şekilde entegre et)
+Canlı bahis oranı farkı (ev/deplasman takımı için)} analizlerine göre hesaplansın.
+Tahmin Loglarını Drive’a Otomatik Kaydet
+Günlük tahminleri Drive’a CSV olarak kaydet
+ predictions_log.csv günlüğünü düzenli olarak güncelle
